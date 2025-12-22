@@ -13,9 +13,12 @@
 
 package frc.robot.subsystems.drive;
 
-import static edu.wpi.first.units.Units.*;
+import static edu.wpi.first.units.Units.MetersPerSecond;
+import static edu.wpi.first.units.Units.Volts;
 
 import com.ctre.phoenix6.CANBus;
+import com.ctre.phoenix6.hardware.Pigeon2;
+import com.ctre.phoenix6.sim.Pigeon2SimState;
 import com.pathplanner.lib.auto.AutoBuilder;
 import com.pathplanner.lib.config.ModuleConfig;
 import com.pathplanner.lib.config.PIDConstants;
@@ -33,9 +36,7 @@ import edu.wpi.first.math.geometry.Pose3d;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.geometry.Rotation3d;
 import edu.wpi.first.math.geometry.Translation2d;
-import edu.wpi.first.math.geometry.Twist2d;
 import edu.wpi.first.math.kinematics.ChassisSpeeds;
-// import edu.wpi.first.math.kinematics.Odometry;
 import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
 import edu.wpi.first.math.kinematics.SwerveModulePosition;
 import edu.wpi.first.math.kinematics.SwerveModuleState;
@@ -46,6 +47,9 @@ import edu.wpi.first.wpilibj.Alert;
 import edu.wpi.first.wpilibj.Alert.AlertType;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.DriverStation.Alliance;
+import edu.wpi.first.wpilibj.RobotBase;
+import edu.wpi.first.wpilibj.smartdashboard.Field2d;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import edu.wpi.first.wpilibj2.command.sysid.SysIdRoutine;
@@ -90,6 +94,11 @@ public class Drive extends SubsystemBase {
           getModuleTranslations());
 
   static final Lock odometryLock = new ReentrantLock();
+  private final Field2d m_field = new Field2d();
+  private final Pigeon2 m_gryo;
+
+  private Pigeon2SimState m_gyrosim;
+
   private final GyroIO gyroIO;
   private final GyroIOInputsAutoLogged gyroInputs = new GyroIOInputsAutoLogged();
   private final Module[] modules = new Module[4]; // FL, FR, BL, BR
@@ -106,7 +115,7 @@ public class Drive extends SubsystemBase {
         new SwerveModulePosition(),
         new SwerveModulePosition()
       };
-  private SwerveDrivePoseEstimator poseEstimator =
+  private final SwerveDrivePoseEstimator poseEstimator =
       new SwerveDrivePoseEstimator(kinematics, rawGyroRotation, lastModulePositions, new Pose2d());
 
   public Drive(
@@ -120,6 +129,9 @@ public class Drive extends SubsystemBase {
     modules[1] = new Module(frModuleIO, 1, TunerConstants.FrontRight);
     modules[2] = new Module(blModuleIO, 2, TunerConstants.BackLeft);
     modules[3] = new Module(brModuleIO, 3, TunerConstants.BackRight);
+    m_gryo = new Pigeon2(0);
+
+    SmartDashboard.putData(m_field);
 
     // Usage reporting for swerve template
     HAL.report(tResourceType.kResourceType_RobotDrive, tInstances.kRobotDriveSwerve_AdvantageKit);
@@ -159,22 +171,63 @@ public class Drive extends SubsystemBase {
                 (state) -> Logger.recordOutput("Drive/SysIdState", state.toString())),
             new SysIdRoutine.Mechanism(
                 (voltage) -> runCharacterization(voltage.in(Volts)), null, this));
+
+    if (RobotBase.isSimulation()) {
+      m_gyrosim = m_gryo.getSimState();
+    }
+  }
+
+  @Override
+  public void simulationPeriodic() {
+    if (RobotBase.isSimulation() && m_gyrosim != null) {
+
+      // 1. Get the current chassis speeds from your odometry or physics engine.
+      // The SwerveDriveKinematics object can convert current module *states* back into *chassis
+      // speeds*.
+      // The result will contain an 'omega' field in RADIANS per second.
+      ChassisSpeeds currentSpeeds =
+          kinematics.toChassisSpeeds(
+              modules[0].getState(),
+              modules[1].getState(),
+              modules[2].getState(),
+              modules[3].getState());
+
+      // 2. Get the angular velocity (omega) in radians/second
+      double omegaRadiansPerSec = currentSpeeds.omegaRadiansPerSecond;
+
+      // 3. Convert radians/second to degrees/second
+      double omegaDegreesPerSec = Math.toDegrees(omegaRadiansPerSec);
+
+      // 4. Add the incremental change to the Pigeon Sim State
+      // We multiply by the loop time (0.02s or 20ms) to get the delta angle for this cycle.
+      m_gyrosim.addYaw(omegaDegreesPerSec * 0.020);
+    }
   }
 
   @Override
   public void periodic() {
-    odometryLock.lock(); // Prevents odometry updates while reading data
-
-    Pose2d pose = getPose();
-    Pose3d pose3d = new Pose3d(pose.getX(), pose.getY(), 0.0, new Rotation3d(pose.getRotation()));
-    
+    odometryLock.lock();
 
     gyroIO.updateInputs(gyroInputs);
     Logger.processInputs("Drive/Gyro", gyroInputs);
+
     for (var module : modules) {
       module.periodic();
     }
+
+    // === ODOMETRY UPDATE LOOP STAYS INSIDE LOCK ===
+    double[] sampleTimestamps = modules[0].getOdometryTimestamps();
+    int sampleCount = sampleTimestamps.length;
+
+    for (int i = 0; i < sampleCount; i++) {
+      rawGyroRotation = getRotation2d();
+      poseEstimator.updateWithTime(sampleTimestamps[i], rawGyroRotation, lastModulePositions);
+    }
+
     odometryLock.unlock();
+
+    // Visualization/logging AFTER unlock
+    m_field.setRobotPose(getPose());
 
     // Stop moving when disabled
     if (DriverStation.isDisabled()) {
@@ -190,9 +243,6 @@ public class Drive extends SubsystemBase {
     }
 
     // Update odometry
-    double[] sampleTimestamps =
-        modules[0].getOdometryTimestamps(); // All signals are sampled together
-    int sampleCount = sampleTimestamps.length;
     for (int i = 0; i < sampleCount; i++) {
       // Read wheel positions and deltas from each module
       SwerveModulePosition[] modulePositions = new SwerveModulePosition[4];
@@ -208,21 +258,19 @@ public class Drive extends SubsystemBase {
       }
 
       // Update gyro angle
-      if (gyroInputs.connected) {
-        // Use the real gyro angle
-        rawGyroRotation = gyroInputs.odometryYawPositions[i];
-      } else {
-        // Use the angle delta from the kinematics and module deltas
-        Twist2d twist = kinematics.toTwist2d(moduleDeltas);
-        rawGyroRotation = rawGyroRotation.plus(new Rotation2d(twist.dtheta));
-      }
+      rawGyroRotation = getRotation2d();
 
       // Apply update
       poseEstimator.updateWithTime(sampleTimestamps[i], rawGyroRotation, modulePositions);
     }
 
+    Pose2d pose = getPose();
+    Pose3d pose3d = new Pose3d(pose.getX(), pose.getY(), 0.0, new Rotation3d(pose.getRotation()));
+
     // Update gyro alert
-    gyroDisconnectedAlert.set(!gyroInputs.connected && Constants.currentMode != Mode.SIM);
+    boolean gyroAvailable = gyroInputs.connected || (RobotBase.isSimulation() && m_gyrosim != null);
+
+    gyroDisconnectedAlert.set(!gyroAvailable && Constants.currentMode != Mode.SIM);
     Logger.recordOutput("Odometry/Robot3d", pose3d);
   }
 
@@ -333,6 +381,9 @@ public class Drive extends SubsystemBase {
   /** Returns the current odometry pose. */
   @AutoLogOutput(key = "Odometry/Robot")
   public Pose2d getPose() {
+    if (poseEstimator == null) {
+      throw new IllegalStateException("PoseEstimator is not initialized.");
+    }
     return poseEstimator.getEstimatedPosition();
   }
 
@@ -343,7 +394,14 @@ public class Drive extends SubsystemBase {
 
   /** Resets the current odometry pose. */
   public void setPose(Pose2d pose) {
-    poseEstimator.resetPosition(rawGyroRotation, getModulePositions(), pose);
+    if (poseEstimator == null) {
+      throw new IllegalStateException("PoseEstimator is not initialized.");
+    }
+    poseEstimator.resetPosition(
+        getRotation2d(), // Ensure this method is implemented and returns a valid Rotation2d
+        getModulePositions(), // Ensure this method is implemented and returns valid module
+        // positions
+        pose);
   }
 
   /** Adds a new timestamped vision measurement. */
@@ -373,5 +431,16 @@ public class Drive extends SubsystemBase {
       new Translation2d(TunerConstants.BackLeft.LocationX, TunerConstants.BackLeft.LocationY),
       new Translation2d(TunerConstants.BackRight.LocationX, TunerConstants.BackRight.LocationY)
     };
+  }
+
+  private Rotation2d getRotation2d() {
+    if (gyroInputs.connected) {
+      return gyroInputs.yawPosition;
+    } else {
+      // Fallback to kinematics-based heading estimation
+      ChassisSpeeds chassisSpeeds = getChassisSpeeds();
+      double deltaThetaRadians = chassisSpeeds.omegaRadiansPerSecond / ODOMETRY_FREQUENCY;
+      return rawGyroRotation.plus(new Rotation2d(deltaThetaRadians));
+    }
   }
 }
