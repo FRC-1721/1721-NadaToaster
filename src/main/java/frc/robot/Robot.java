@@ -174,6 +174,4 @@ public class Robot extends LoggedRobot {
   public void simulationInit() {}
 
   /** This function is called periodically whilst in simulation. */
-  @Override
-  public void simulationPeriodic() {}
 }

@@ -48,6 +48,10 @@ import edu.wpi.first.wpilibj.Alert.AlertType;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.DriverStation.Alliance;
 import edu.wpi.first.wpilibj.RobotBase;
+import edu.wpi.first.wpilibj.simulation.DifferentialDrivetrainSim;
+import edu.wpi.first.wpilibj.simulation.DifferentialDrivetrainSim.KitbotGearing;
+import edu.wpi.first.wpilibj.simulation.DifferentialDrivetrainSim.KitbotMotor;
+import edu.wpi.first.wpilibj.simulation.DifferentialDrivetrainSim.KitbotWheelSize;
 import edu.wpi.first.wpilibj.smartdashboard.Field2d;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
@@ -117,6 +121,9 @@ public class Drive extends SubsystemBase {
       };
   private final SwerveDrivePoseEstimator poseEstimator =
       new SwerveDrivePoseEstimator(kinematics, rawGyroRotation, lastModulePositions, new Pose2d());
+  private final DifferentialDrivetrainSim sim =
+      DifferentialDrivetrainSim.createKitbotSim(
+          KitbotMotor.kDualCIMPerSide, KitbotGearing.k10p71, KitbotWheelSize.kSixInch, null);
 
   public Drive(
       GyroIO gyroIO,
@@ -175,6 +182,10 @@ public class Drive extends SubsystemBase {
     if (RobotBase.isSimulation()) {
       m_gyrosim = m_gryo.getSimState();
     }
+  }
+
+  public void run(double xAxis, double zAxis) {
+    sim.setInputs((xAxis - zAxis) * 12.0, (xAxis + zAxis) * 12.0);
   }
 
   @Override
