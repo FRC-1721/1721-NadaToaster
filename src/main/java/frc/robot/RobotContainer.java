@@ -19,16 +19,21 @@ import static frc.robot.subsystems.vision.VisionConstants.robotToCamera0;
 import static frc.robot.subsystems.vision.VisionConstants.robotToCamera1;
 
 import com.pathplanner.lib.auto.AutoBuilder;
-import edu.wpi.first.math.controller.PIDController;
+import com.pathplanner.lib.auto.NamedCommands;
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Transform2d;
+import edu.wpi.first.math.geometry.Translation2d;
 import edu.wpi.first.wpilibj.GenericHID;
 import edu.wpi.first.wpilibj.XboxController;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.Commands;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
 import edu.wpi.first.wpilibj2.command.sysid.SysIdRoutine;
+import frc.robot.FieldConstants.ReefSide;
 import frc.robot.commands.DriveCommands;
+import frc.robot.commands.DriveToPose;
+import frc.robot.commands.JoystickApproachCommand;
 import frc.robot.generated.TunerConstants;
 import frc.robot.subsystems.drive.Drive;
 import frc.robot.subsystems.drive.GyroIO;
@@ -40,6 +45,8 @@ import frc.robot.subsystems.vision.Vision;
 import frc.robot.subsystems.vision.VisionIO;
 import frc.robot.subsystems.vision.VisionIOPhotonVision;
 import frc.robot.subsystems.vision.VisionIOPhotonVisionSim;
+import frc.robot.util.LoggedTunableNumber;
+import java.util.function.Supplier;
 import org.littletonrobotics.junction.networktables.LoggedDashboardChooser;
 
 /**
@@ -50,12 +57,17 @@ import org.littletonrobotics.junction.networktables.LoggedDashboardChooser;
  */
 public class RobotContainer {
   // Subsystems
-  private final Drive drive;
+  public final Drive drive;
 
   private final Vision vision;
 
   // Controller
   private final CommandXboxController controller = new CommandXboxController(0);
+
+  public LoggedTunableNumber speedMultiplier =
+      new LoggedTunableNumber("Drivebase Speed Multiplier", 1.0);
+  private LoggedTunableNumber alignPredictionSeconds =
+      new LoggedTunableNumber("Align Prediction Seconds", 0.3);
 
   // Dashboard inputs
   private final LoggedDashboardChooser<Command> autoChooser;
@@ -108,6 +120,9 @@ public class RobotContainer {
         break;
     }
 
+    // Register named commands
+    registerNamedCommands();
+
     // Set up auto routines
     autoChooser = new LoggedDashboardChooser<>("Auto Choices", AutoBuilder.buildAutoChooser());
 
@@ -131,6 +146,15 @@ public class RobotContainer {
     configureButtonBindings();
   }
 
+  private Command joystickApproach(Supplier<Pose2d> approachPose) {
+    return new JoystickApproachCommand(
+        drive, () -> -controller.getLeftY() * speedMultiplier.getAsDouble(), approachPose);
+  }
+
+  private Pose2d getFuturePose(double seconds) {
+    return drive.getPose().exp(drive.getChassisSpeeds().toTwist2d(seconds));
+  }
+
   /**
    * Use this method to define your button->command mappings. Buttons can be created by
    * instantiating a {@link GenericHID} or one of its subclasses ({@link
@@ -146,20 +170,33 @@ public class RobotContainer {
             () -> -controller.getLeftX(),
             () -> -controller.getRightX()));
 
-    @SuppressWarnings("resource")
-    PIDController aimController = new PIDController(0.2, 0.0, 0.0);
-    aimController.enableContinuousInput(-Math.PI, Math.PI);
     controller
         .leftBumper()
+        .and(controller.a().negate())
         .whileTrue(
-            Commands.startRun(
-                () -> {
-                  aimController.reset();
-                },
-                () -> {
-                  drive.run(0.0, aimController.calculate(vision.getTargetX(0).getRadians()));
-                },
-                drive));
+            joystickApproach(
+                () ->
+                    FieldConstants.getNearestReefBranch(
+                        getFuturePose(alignPredictionSeconds.get()), ReefSide.LEFT)));
+
+    controller
+        .rightBumper()
+        .and(controller.a().negate())
+        .whileTrue(
+            joystickApproach(
+                () ->
+                    FieldConstants.getNearestReefBranch(
+                        getFuturePose(alignPredictionSeconds.get()), ReefSide.RIGHT)));
+
+    controller
+        .leftBumper()
+        .and(controller.rightBumper())
+        .and(controller.a().negate())
+        .whileTrue(
+            joystickApproach(
+                () ->
+                    FieldConstants.getNearestReefFace(
+                        getFuturePose(alignPredictionSeconds.get()))));
 
     // Lock to 0° when A button is held
     controller
@@ -184,6 +221,40 @@ public class RobotContainer {
                             new Pose2d(drive.getPose().getTranslation(), new Rotation2d())),
                     drive)
                 .ignoringDisable(true));
+  }
+
+  // Back off distance amount
+  private static final double BACKOFF = 0.7;
+
+  private void registerNamedCommands() {
+    switch (Constants.currentMode) {
+      default:
+        NamedCommands.registerCommand(
+            "AutoAlignLeft",
+            new DriveToPose(
+                drive,
+                () ->
+                    FieldConstants.getNearestReefBranch(drive.getPose(), ReefSide.LEFT)
+                        .transformBy(
+                            new Transform2d(
+                                new Translation2d(BACKOFF, 0.0), Rotation2d.fromRadians(Math.PI))),
+                0.005,
+                0.01,
+                Math.toRadians(2)));
+
+        NamedCommands.registerCommand(
+            "AutoAlignRight",
+            new DriveToPose(
+                drive,
+                () ->
+                    FieldConstants.getNearestReefBranch(drive.getPose(), ReefSide.RIGHT)
+                        .transformBy(
+                            new Transform2d(
+                                new Translation2d(BACKOFF, 0.0), Rotation2d.fromRadians(Math.PI))),
+                0.005,
+                0.01,
+                Math.toRadians(2)));
+    }
   }
 
   /**
